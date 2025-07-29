@@ -1,241 +1,136 @@
 #!/usr/bin/env python3
 
-import ctypes
-import ctypes.wintypes as wintypes
-import glob
+"""FastAPI server bridging Google Gemini function calls to Obsidian."""
+
+from __future__ import annotations
+
 import os
-import platform
-import subprocess
+from typing import Any, Callable, Awaitable, Dict
 
-from mcp.server.fastmcp import FastMCP
+import httpx
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-mcp = FastMCP("fleur")
+OBSIDIAN_API_URL = os.getenv("OBSIDIAN_API_URL", "http://127.0.0.1:27123")
+OBSIDIAN_API_KEY = os.getenv("OBSIDIAN_API_KEY")
 
-FLEUR_EXPLANATION = """
-    When a user says "hello fleur", say the following:
-
-    Oh nice, I see that you installed Fleur!
-
-    Fleur is the app store that lets you use your favorite apps without leaving this chat.
-
-    For example, you can use the Gmail app to:
-    - Check your inbox
-    - Read important emails
-    - Draft responses while staying within our conversation
-
-    You can also use other apps like Linear, Slack, and more!
-
-    Now type "open fleur" to get started.
-"""
+app = FastAPI(title="Fleur MCP")
 
 
-def find_windows_executable(name, search_dirs=None):
-    """Simple but reliable function to find an executable.
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
-    Args:
-        name: Name of the executable (e.g., "Fleur.exe")
-        search_dirs: List of directories to search in. If None, uses default locations.
+class FunctionCall(BaseModel):
+    """Representation of a Gemini function call."""
 
-    Returns:
-        str: Full path to the executable if found, None otherwise
-    """
-    if search_dirs is None:
-        search_dirs = [
-            os.path.join(os.path.expanduser("~"), "AppData", "Local"),
-            os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
-            os.environ.get("ProgramFiles", "C:\\Program Files"),
-            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-        ]
+    name: str
+    args: Dict[str, Any] | None = None
 
-    direct_paths = [
-        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Fleur", "Fleur.exe"),
-        os.path.join(
-            os.path.expanduser("~"), "AppData", "Roaming", "Fleur", "Fleur.exe"
-        ),
-        os.path.join(
-            os.environ.get("ProgramFiles", "C:\\Program Files"), "Fleur", "Fleur.exe"
-        ),
-        os.path.join(
-            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-            "Fleur",
-            "Fleur.exe",
-        ),
-    ]
 
-    for path in direct_paths:
-        if os.path.isfile(path):
-            return path
+class FunctionCallPart(BaseModel):
+    function_call: FunctionCall
+
+
+class CandidateContent(BaseModel):
+    parts: list[FunctionCallPart]
+
+
+class Candidate(BaseModel):
+    content: CandidateContent
+
+
+class GeminiRequest(BaseModel):
+    candidates: list[Candidate]
+
+
+# ---------------------------------------------------------------------------
+# Obsidian interaction helpers
+# ---------------------------------------------------------------------------
+
+async def _request(
+    method: str, path: str, *, content: str | None = None
+) -> str:
+    headers = {}
+    if OBSIDIAN_API_KEY:
+        headers["Authorization"] = f"Bearer {OBSIDIAN_API_KEY}"
+
+    # S'assurer que le Content-Type est correct pour les requêtes avec corps
+    if content is not None:
+        headers['Content-Type'] = 'text/markdown'
+
+    url = f"{OBSIDIAN_API_URL.rstrip('/')}/{path.lstrip('/')}"
+    async with httpx.AsyncClient() as client:
+        response = await client.request(method, url, content=content.encode('utf-8') if content else None, headers=headers)
+        response.raise_for_status()
+        return response.text
+
+
+async def lire_note(chemin_fichier: str) -> str:
+    """Read a note from Obsidian."""
+    return await _request("GET", f"vault/{chemin_fichier}")
+
+
+async def creer_ou_ecraser_note(chemin_fichier: str, contenu: str) -> str:
+    """Create or replace a note in Obsidian."""
+    return await _request("PUT", f"vault/{chemin_fichier}", content=contenu)
+
+
+async def ajouter_a_la_note(chemin_fichier: str, contenu_a_ajouter: str) -> str:
+    """Append content to an existing note in Obsidian."""
+    # L'API Local REST utilise POST pour l'ajout (append)
+    return await _request("POST", f"vault/{chemin_fichier}", content=contenu_a_ajouter)
+
+
+TOOLS: dict[str, Callable[..., Awaitable[str]]] = {
+    "lire_note": lire_note,
+    "creer_ou_ecraser_note": creer_ou_ecraser_note,
+    "ajouter_a_la_note": ajouter_a_la_note,
+}
+
+
+# ---------------------------------------------------------------------------
+# API endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/")
+async def handle_function_call(payload: GeminiRequest) -> dict[str, Any]:
+    """Handle Gemini function calls."""
+    try:
+        call = payload.candidates[0].content.parts[0].function_call
+    except (IndexError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid request format")
+
+    tool = TOOLS.get(call.name)
+    if tool is None:
+        return {
+            "tool_response": {
+                "name": call.name,
+                "response": {"content": f"Erreur: fonction inconnue '{call.name}'"},
+            }
+        }
 
     try:
-        result = subprocess.run(
-            ["where", name], capture_output=True, text=True, check=False
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().split("\n")[0]
-    except Exception:
-        pass
+        args = call.args or {}
+        result = await tool(**args)
+    except Exception as exc:
+        return {
+            "tool_response": {
+                "name": call.name,
+                "response": {"content": f"Erreur: {exc}"},
+            }
+        }
 
-    for directory in search_dirs:
-        if not os.path.exists(directory):
-            continue
-
-        path = os.path.join(directory, name)
-        if os.path.isfile(path):
-            return path
-
-        path = os.path.join(directory, "Fleur", name)
-        if os.path.isfile(path):
-            return path
-
-        matches = glob.glob(os.path.join(directory, "*", name))
-        if matches:
-            return matches[0]
-
-    return None
+    return {"tool_response": {"name": call.name, "response": {"content": result}}}
 
 
-@mcp.tool("hello_fleur")
-def hello_fleur() -> str:
-    """Explain what Fleur is when a user types 'hello fleur'.
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
-    Returns:
-        str: An explanation about Fleur if triggered, empty string otherwise
-    """
-
-    return FLEUR_EXPLANATION
-
-
-@mcp.tool("open_fleur")
-def open_fleur():
-    """Open the Fleur app.
-
-    Returns:
-        str: A message indicating that the Fleur app has been opened
-    """
-
-    try:
-        config_dir = os.path.expanduser("~/.fleur")
-        os.makedirs(config_dir, exist_ok=True)
-
-        onboarding_file = os.path.join(config_dir, "onboarding_completed")
-
-        onboarding_completed = os.path.exists(onboarding_file)
-
-        if not onboarding_completed:
-            with open(onboarding_file, "w") as f:
-                f.write("true")
-    except Exception as e:
-        print(f"Error managing Fleur onboarding state: {e}")
-
-    try:
-        if platform.system() == "Darwin":
-            applescript = """
-            tell application "Fleur" to activate
-            delay 0.5
-
-            tell application "System Events"
-                # Get the Fleur window
-                set fleurProcess to process "Fleur"
-
-                # If Fleur has windows and is running, bring it to front
-                if (exists fleurProcess) and (count of windows of fleurProcess) > 0 then
-                    set frontmost of fleurProcess to true
-                end if
-            end tell
-            """
-            subprocess.run(["osascript", "-e", applescript], check=True)
-        elif platform.system() == "Windows":
-            try:
-                user32 = ctypes.WinDLL("user32", use_last_error=True)
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                psapi = ctypes.WinDLL("psapi", use_last_error=True)
-
-                EnumWindowsProc = ctypes.WINFUNCTYPE(
-                    wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
-                )
-
-                SW_RESTORE = 9
-
-                fleur_path = find_windows_executable("Fleur.exe")
-                if not fleur_path:
-                    print(
-                        "Fleur executable not found. Please install Fleur or ensure it's in a standard location."
-                    )
-                    return
-
-                MAX_PATH = 260
-                fleur_windows = []
-
-                def get_process_path(hwnd):
-                    try:
-                        pid = wintypes.DWORD()
-                        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-
-                        process_handle = kernel32.OpenProcess(
-                            0x1000,
-                            False,
-                            pid.value,
-                        )
-
-                        if process_handle:
-                            try:
-                                path_buffer = ctypes.create_unicode_buffer(MAX_PATH)
-                                path_len = psapi.GetModuleFileNameExW(
-                                    process_handle, None, path_buffer, MAX_PATH
-                                )
-
-                                if path_len > 0:
-                                    process_path = path_buffer.value
-                                    kernel32.CloseHandle(process_handle)
-                                    return process_path
-
-                            finally:
-                                kernel32.CloseHandle(process_handle)
-                    except Exception:
-                        pass
-
-                    return None
-
-                def enum_windows_callback(hwnd, lparam):
-                    if user32.IsWindowVisible(hwnd):
-                        process_path = get_process_path(hwnd)
-
-                        if process_path and (
-                            os.path.normpath(process_path)
-                            == os.path.normpath(fleur_path)
-                            or "\\Fleur\\" in process_path
-                        ):
-                            fleur_windows.append(hwnd)
-
-                    return True
-
-                user32.EnumWindows(EnumWindowsProc(enum_windows_callback), 0)
-
-                if fleur_windows:
-                    hwnd = fleur_windows[0]
-                    user32.ShowWindow(hwnd, SW_RESTORE)
-                    user32.SetForegroundWindow(hwnd)
-                else:
-                    if fleur_path:
-                        subprocess.Popen(fleur_path)
-            except Exception as e:
-                print(f"Error focusing Fleur window: {e}")
-                try:
-                    fleur_path = find_windows_executable("Fleur.exe")
-                    if fleur_path:
-                        subprocess.Popen(fleur_path)
-                    else:
-                        print(
-                            "Fleur executable not found. Please install Fleur or ensure it's in a standard location."
-                        )
-                except Exception as launch_error:
-                    print(f"Error launching Fleur: {launch_error}")
-    except subprocess.SubprocessError as e:
-        print(f"Error refocusing Fleur: {e}")
-
-
-def main():
-    mcp.run(transport="stdio")
+def main() -> None:
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 if __name__ == "__main__":
